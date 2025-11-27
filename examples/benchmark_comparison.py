@@ -89,8 +89,8 @@ def run_stress_test():
     # Setup Model
     # NOTE: Ensure you are using the FIXED grid_range=[-3, 3] in layer.py
     model = nn.Sequential(
-        FusionKANLayer(2, 32, grid_size=10, spline_order=3, grid_range=[-3, 3]), 
-        FusionKANLayer(32, 1, grid_size=10, spline_order=3, grid_range=[-3, 3], is_output=True)
+        FusionKANLayer(2, 32, grid_size=30, spline_order=3, grid_range=[-3, 3]), 
+        FusionKANLayer(32, 1, grid_size=30, spline_order=3, grid_range=[-3, 3], is_output=True)
     ).to(DEVICE)
     
     tracker.register_hooks(model)
