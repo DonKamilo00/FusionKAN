@@ -1,3 +1,4 @@
+# Overwrite layer.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +17,6 @@ class FusionKANLayer(nn.Module):
         self.grid_min = grid_range[0]
         self.grid_max = grid_range[1]
         
-        self.scale_spline = scale_spline
         self.is_output = is_output
         
         # Weights: [Out, In, Coeffs]
@@ -27,7 +27,12 @@ class FusionKANLayer(nn.Module):
         self.base_weight = nn.Parameter(torch.randn(out_features, in_features) * (1 / math.sqrt(in_features)))
         self.base_bias = nn.Parameter(torch.zeros(out_features))
         
-        # Activation & Norm (skipped for output layers in regression tasks)
+        # Learnable Scales (Per Output Channel)
+        # This is critical for convergence on high-frequency functions
+        self.scale_base = nn.Parameter(torch.ones(out_features) * scale_base)
+        self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
+        
+        # Activation & Norm
         if not is_output:
             self.layer_norm = nn.LayerNorm(out_features)
             self.prelu = nn.PReLU()
@@ -39,6 +44,8 @@ class FusionKANLayer(nn.Module):
         
         # 1. Base Linear Path
         base_output = F.linear(self.base_activation(x), self.base_weight, self.base_bias)
+        # Apply learnable scale (broadcast over batch)
+        base_output = base_output * self.scale_base.view(1, -1)
         
         # 2. Spline Path (Fused CUDA)
         if x.device.type == 'cuda':
@@ -50,11 +57,13 @@ class FusionKANLayer(nn.Module):
                 self.grid_max
             )
         else:
-            # Fallback for CPU (Optional, but good practice for libraries)
             raise NotImplementedError("FusionKAN only supports CUDA tensors for now.")
             
+        # Apply learnable scale to spline output
+        spline_output = spline_output * self.scale_spline.view(1, -1)
+        
         # 3. Combine
-        y = base_output + spline_output * self.scale_spline
+        y = base_output + spline_output
         
         if self.is_output:
             return y
