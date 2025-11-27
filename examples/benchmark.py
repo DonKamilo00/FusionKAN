@@ -1,8 +1,19 @@
-# Overwrite the benchmark script with one that prints results
-code = """
+
 import torch
 import time
-from fusion_kan import FusionKANLayer
+import sys
+import os
+
+# Add current dir to path so we can import fusion_kan if not installed globally
+sys.path.append(os.getcwd())
+
+try:
+    from fusion_kan import FusionKANLayer
+except ImportError:
+    # Fallback if running from root without install
+    import sys
+    sys.path.append('..')
+    from fusion_kan import FusionKANLayer
 
 def run():
     if not torch.cuda.is_available():
@@ -44,7 +55,7 @@ def run():
     total_time = end - start
     iter_time = (total_time / 100) * 1000 # ms
     
-    print(f"\\n✅ SUCCESS!")
+    print(f"\n✅ SUCCESS!")
     print(f"Total Time: {total_time:.4f}s")
     print(f"Time per Iteration: {iter_time:.2f} ms")
     
@@ -54,9 +65,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-"""
-
-with open("FusionKAN/examples/benchmark.py", "w") as f:
-    f.write(code)
-
-print("Benchmark script updated.")
