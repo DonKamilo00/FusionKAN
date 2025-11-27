@@ -5,7 +5,7 @@ import math
 from .functional import FusionKANFunction
 
 class FusionKANLayer(nn.Module):
-    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, base_activation=nn.SiLU, grid_eps=0.02, grid_range=[-1, 1], is_output=False):
+    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0, base_activation=nn.SiLU, grid_eps=0.02, grid_range=[-3, 3], is_output=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features

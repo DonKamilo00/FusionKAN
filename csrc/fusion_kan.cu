@@ -106,10 +106,6 @@ __global__ void backward_weights_kernel(const T* __restrict__ grad_out, const T*
     
     for (int t = tid; t < nout * ncoeffs; t += blockDim.x) {
         int o = t / ncoeffs; int c = t % ncoeffs;
-        if (abs(s_accum[t]) > 1e-9) {
-            int g_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + c;
-            atomicAdd(&grad_weights[g_ptr], static_cast<T>(s_accum[t]));
-        }
     }
 }
 
