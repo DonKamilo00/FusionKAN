@@ -11,29 +11,30 @@ class FusionKANLayer(nn.Module):
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
-        
-        # Grid configuration
         self.grid_min = grid_range[0]
         self.grid_max = grid_range[1]
-        
         self.is_output = is_output
         
-        # Weights: [Out, In, Coeffs]
         num_coeffs = grid_size + spline_order
         
-        # [FIX] Initialize with scale_noise directly (0.1), do NOT divide by grid_size
-        self.spline_weight = nn.Parameter(torch.randn(out_features, in_features, num_coeffs) * scale_noise)
-        
-        # Base Linear Weights
-        self.base_weight = nn.Parameter(torch.randn(out_features, in_features) * (1 / math.sqrt(in_features)))
+        # --- WEIGHTS ---
+        # [Out, In, Coeffs]
+        self.spline_weight = nn.Parameter(torch.empty(out_features, in_features, num_coeffs))
+        self.base_weight = nn.Parameter(torch.empty(out_features, in_features))
         self.base_bias = nn.Parameter(torch.zeros(out_features))
         
-        # Learnable Scales (Per Output Channel)
-        # This is critical for convergence on high-frequency functions
+        # --- INITIALIZATION (Matching Original KAN) ---
+        # 1. Splines: Uniform[-scale, scale]
+        nn.init.uniform_(self.spline_weight, -scale_noise, scale_noise)
+        
+        # 2. Base: Kaiming Uniform (He Init)
+        # We use the same scaling factor as the paper (sqrt(5) * scale_base)
+        nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * scale_base)
+        
+        # --- SCALES ---
         self.scale_base = nn.Parameter(torch.ones(out_features) * scale_base)
         self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
         
-        # Activation & Norm
         if not is_output:
             self.layer_norm = nn.LayerNorm(out_features)
             self.prelu = nn.PReLU()
@@ -41,16 +42,15 @@ class FusionKANLayer(nn.Module):
         self.base_activation = base_activation()
 
     def forward(self, x):
-        # x shape: [Batch, In]
-        
-        # 1. Base Linear Path
-        base_output = F.linear(self.base_activation(x), self.base_weight, self.base_bias)
-        # Apply learnable scale (broadcast over batch)
-        base_output = base_output * self.scale_base.view(1, -1)
+        # 1. Base Path
+        # Apply base weights
+        base = F.linear(self.base_activation(x), self.base_weight, self.base_bias)
+        # Apply learnable scale
+        base = base * self.scale_base.view(1, -1)
         
         # 2. Spline Path (Fused CUDA)
         if x.device.type == 'cuda':
-            spline_output = FusionKANFunction.apply(
+            spline = FusionKANFunction.apply(
                 x, 
                 self.spline_weight, 
                 self.grid_size, 
@@ -58,13 +58,13 @@ class FusionKANLayer(nn.Module):
                 self.grid_max
             )
         else:
-            raise NotImplementedError("FusionKAN only supports CUDA tensors for now.")
+            raise NotImplementedError("FusionKAN only supports CUDA tensors.")
             
-        # Apply learnable scale to spline output
-        spline_output = spline_output * self.scale_spline.view(1, -1)
+        # Apply learnable scale
+        spline = spline * self.scale_spline.view(1, -1)
         
         # 3. Combine
-        y = base_output + spline_output
+        y = base + spline
         
         if self.is_output:
             return y
