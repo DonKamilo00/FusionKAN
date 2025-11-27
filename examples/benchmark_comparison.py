@@ -71,10 +71,10 @@ def run_benchmark():
     # --- STRATEGY TO BEAT ORIGINAL KAN ---
     WIDTH = [2, 64, 1]
     
-    # GRID=30 with range [-3,3] gives similar resolution density 
-    # as GRID=10 with range [-1,1].
-    # This recovers the accuracy we lost by expanding the range.
-    GRID = 30 
+    # GRID=20 on range [-2, 2] gives step size 0.2
+    # This matches Original KAN (Grid 10 on range [-1, 1] => step size 0.2)
+    # This recovers accuracy while keeping parameters low.
+    GRID = 20
     K = 3
     STEPS = 500
     BATCH = 2048
@@ -97,7 +97,6 @@ def run_benchmark():
 
     # 2. Train FusionKAN (Pure Mode)
     fused_model = nn.Sequential(
-        # use_node_activation=False removes LayerNorm/PReLU to match Original KAN architecture
         FusionKANLayer(2, 64, grid_size=GRID, spline_order=K, use_node_activation=False),
         FusionKANLayer(64, 1, grid_size=GRID, spline_order=K, is_output=True)
     ).to(DEVICE)
