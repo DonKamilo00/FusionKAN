@@ -1,4 +1,4 @@
-# FusionKAN: High-Performance CUDA Kolmogorov-Arnold Networks
+# [WIP] FusionKAN: High-Performance CUDA Kolmogorov-Arnold Networks
 
 **FusionKAN** is a highly optimized PyTorch library for Kolmogorov-Arnold Networks (KANs). By fusing B-spline computation, coefficient gathering, and matrix multiplication into a single CUDA kernel, it achieves **7-10x speedups** and **Linear Memory Scaling** compared to standard implementations.
 
