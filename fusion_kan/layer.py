@@ -26,7 +26,7 @@ class FusionKANLayer(nn.Module):
         self.base_bias = nn.Parameter(torch.zeros(out_features))
         
         # --- INITIALIZATION ---
-        # 1. Splines: Uniform [-scale, scale] to match Original KAN
+        # 1. Splines: Uniform [-scale, scale]
         nn.init.uniform_(self.spline_weight, -scale_noise, scale_noise)
         
         # 2. Base: Kaiming Uniform (He Init)
@@ -36,10 +36,10 @@ class FusionKANLayer(nn.Module):
         self.scale_base = nn.Parameter(torch.ones(out_features) * scale_base)
         self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
         
-        # --- UPGRADE: Auto-Scaling (Instance Normalization) ---
-        # This keeps inputs within the B-Spline's active range [-1, 1]
-        # without needing expensive grid updates.
-        self.input_norm = nn.InstanceNorm1d(in_features, affine=True)
+        # --- UPGRADE: Auto-Scaling (Batch Normalization) ---
+        # Replaces InstanceNorm. 
+        # Maps input distribution to ~N(0,1), which fits the spline grid [-1,1] well.
+        self.input_norm = nn.BatchNorm1d(in_features)
         
         # Activation & Norm
         if not is_output:
@@ -51,9 +51,8 @@ class FusionKANLayer(nn.Module):
     def forward(self, x):
         # x shape: [Batch, In]
         
-        # 1. Auto-Scaling
-        # Reshape for InstanceNorm: [Batch, In] -> [Batch, In, 1] -> Norm -> Squeeze
-        x_norm = self.input_norm(x.unsqueeze(2)).squeeze(2)
+        # 1. Auto-Scaling (BatchNorm handles [Batch, In] directly)
+        x_norm = self.input_norm(x)
         
         # 2. Base Linear Path
         base_output = F.linear(self.base_activation(x_norm), self.base_weight, self.base_bias)
@@ -80,13 +79,3 @@ class FusionKANLayer(nn.Module):
             return y
         
         return self.prelu(self.layer_norm(y))
-
-    def regularization_loss(self, lambda_l1=1e-4, lambda_entropy=1e-4):
-        # L1 Regularization (Sparsity)
-        l1_loss = torch.sum(torch.abs(self.spline_weight))
-        
-        # Entropy Regularization (Peakiness)
-        probs = F.softmax(torch.abs(self.spline_weight), dim=-1)
-        entropy_loss = -torch.sum(probs * torch.log(probs + 1e-8))
-        
-        return lambda_l1 * l1_loss + lambda_entropy * entropy_loss
