@@ -25,9 +25,8 @@ class FusionKANLayer(nn.Module):
         self.base_weight = nn.Parameter(torch.empty(out_features, in_features))
         self.base_bias = nn.Parameter(torch.zeros(out_features))
         
-        # --- INITIALIZATION (CRITICAL FIX) ---
-        # 1. Splines: Uniform [-0.1, 0.1] to match Original KAN
-        # NOT divided by grid_size
+        # --- INITIALIZATION ---
+        # 1. Splines: Uniform [-scale, scale] to match Original KAN
         nn.init.uniform_(self.spline_weight, -scale_noise, scale_noise)
         
         # 2. Base: Kaiming Uniform (He Init)
@@ -37,6 +36,11 @@ class FusionKANLayer(nn.Module):
         self.scale_base = nn.Parameter(torch.ones(out_features) * scale_base)
         self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
         
+        # --- UPGRADE: Auto-Scaling (Instance Normalization) ---
+        # This keeps inputs within the B-Spline's active range [-1, 1]
+        # without needing expensive grid updates.
+        self.input_norm = nn.InstanceNorm1d(in_features, affine=True)
+        
         # Activation & Norm
         if not is_output:
             self.layer_norm = nn.LayerNorm(out_features)
@@ -45,14 +49,20 @@ class FusionKANLayer(nn.Module):
         self.base_activation = base_activation()
 
     def forward(self, x):
-        # 1. Base Linear Path
-        base_output = F.linear(self.base_activation(x), self.base_weight, self.base_bias)
+        # x shape: [Batch, In]
+        
+        # 1. Auto-Scaling
+        # Reshape for InstanceNorm: [Batch, In] -> [Batch, In, 1] -> Norm -> Squeeze
+        x_norm = self.input_norm(x.unsqueeze(2)).squeeze(2)
+        
+        # 2. Base Linear Path
+        base_output = F.linear(self.base_activation(x_norm), self.base_weight, self.base_bias)
         base_output = base_output * self.scale_base.view(1, -1)
         
-        # 2. Spline Path (Fused CUDA)
+        # 3. Spline Path (Fused CUDA)
         if x.device.type == 'cuda':
             spline_output = FusionKANFunction.apply(
-                x, 
+                x_norm, 
                 self.spline_weight, 
                 self.grid_size, 
                 self.grid_min, 
@@ -63,10 +73,20 @@ class FusionKANLayer(nn.Module):
             
         spline_output = spline_output * self.scale_spline.view(1, -1)
         
-        # 3. Combine
+        # 4. Combine
         y = base_output + spline_output
         
         if self.is_output:
             return y
         
         return self.prelu(self.layer_norm(y))
+
+    def regularization_loss(self, lambda_l1=1e-4, lambda_entropy=1e-4):
+        # L1 Regularization (Sparsity)
+        l1_loss = torch.sum(torch.abs(self.spline_weight))
+        
+        # Entropy Regularization (Peakiness)
+        probs = F.softmax(torch.abs(self.spline_weight), dim=-1)
+        entropy_loss = -torch.sum(probs * torch.log(probs + 1e-8))
+        
+        return lambda_l1 * l1_loss + lambda_entropy * entropy_loss
