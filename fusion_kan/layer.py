@@ -1,4 +1,3 @@
-# Overwrite layer.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +20,9 @@ class FusionKANLayer(nn.Module):
         
         # Weights: [Out, In, Coeffs]
         num_coeffs = grid_size + spline_order
-        self.spline_weight = nn.Parameter(torch.randn(out_features, in_features, num_coeffs) * scale_noise / grid_size)
+        
+        # [FIX] Initialize with scale_noise directly (0.1), do NOT divide by grid_size
+        self.spline_weight = nn.Parameter(torch.randn(out_features, in_features, num_coeffs) * scale_noise)
         
         # Base Linear Weights
         self.base_weight = nn.Parameter(torch.randn(out_features, in_features) * (1 / math.sqrt(in_features)))
