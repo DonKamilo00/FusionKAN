@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,9 +17,10 @@ class FusionKANLayer(nn.Module):
         self.grid_size = grid_size
         self.spline_order = spline_order
         
-        # Grid bounds (will be updated dynamically)
-        self.grid_min = grid_range[0]
-        self.grid_max = grid_range[1]
+        # Learnable Grid Bounds
+        # Initialize as Parameters so the optimizer can adjust them
+        self.grid_min = nn.Parameter(torch.tensor(float(grid_range[0])))
+        self.grid_max = nn.Parameter(torch.tensor(float(grid_range[1])))
         
         self.scale_spline = scale_spline
         self.is_output = is_output
@@ -40,27 +39,12 @@ class FusionKANLayer(nn.Module):
         self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
         
         # Normalization
-        # affine=False to ensure inputs are roughly N(0,1), enabling static grid usage 
-        # for simple cases, while update_grid handles distribution shifts.
+        # affine=False to ensure inputs are roughly N(0,1), enabling initial grid usage.
         self.input_norm = nn.BatchNorm1d(in_features, affine=False)
         
         self.layer_norm = nn.LayerNorm(out_features)
         self.prelu = nn.PReLU()
         self.base_activation = base_activation()
-
-    @torch.no_grad()
-    def update_grid(self, x, margin=0.01):
-        """
-        Dynamically adapt grid bounds to input distribution.
-        This prevents the 'dead neuron' problem where data falls outside [-2, 2].
-        """
-        batch_min = x.min().item()
-        batch_max = x.max().item()
-        
-        # Momentum update to avoid jitter
-        momentum = 0.99
-        self.grid_min = momentum * self.grid_min + (1 - momentum) * (batch_min - margin)
-        self.grid_max = momentum * self.grid_max + (1 - momentum) * (batch_max + margin)
 
     def forward(self, x):
         # 1. Norm
@@ -72,8 +56,7 @@ class FusionKANLayer(nn.Module):
         
         # 3. Spline
         if x.device.type == 'cuda':
-            # Note: We pass the scalar values of grid_min/max. 
-            # If update_grid was called, these values are fresh.
+            # Pass Parameters directly. Autograd handles gradients for grid_min/max.
             spline_output = FusionKANFunction.apply(
                 x_norm, 
                 self.spline_weight, 

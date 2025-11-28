@@ -1,33 +1,36 @@
 import torch
 
 # 1. Try to import the compiled C++ extension
-# Note: In setup.py, the extension name is '_fusion_kan_cuda'
 try:
     import _fusion_kan_cuda as _backend
     KERNEL_AVAILABLE = True
 except ImportError:
-    # This happens if the code is run on a machine without the compiled extension
     KERNEL_AVAILABLE = False
     pass
 
 class FusionKANFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inputs, weights, grid_size, grid_min, grid_max):
-        # 2. Check availability at Runtime
+    def forward(ctx, inputs, weights, grid_size, grid_min_val, grid_max_val):
+        # grid_min_val and grid_max_val are Tensors (scalars) so autograd tracks them.
+        
         if not KERNEL_AVAILABLE:
-            raise RuntimeError("FusionKAN CUDA kernel not found. Ensure 'pip install .' was successful and you are on a GPU machine.")
+            raise RuntimeError("FusionKAN CUDA kernel not found. Ensure 'pip install .' was successful.")
         
         # Ensure inputs are [Features, Batch] and contiguous
         inputs_T = inputs.transpose(0, 1).contiguous()
         
-        # CALL THE BACKEND (Not fusion_kan)
-        basis_T, index_T = _backend.compute_basis(inputs_T, grid_size, grid_min, grid_max)
+        # Pass values to CUDA kernel (basis calc depends on these)
+        g_min = grid_min_val.item()
+        g_max = grid_max_val.item()
+        
+        basis_T, index_T = _backend.compute_basis(inputs_T, grid_size, g_min, g_max)
         output_T = _backend.run_forward(basis_T, index_T, weights)
         
+        # Save context
         ctx.save_for_backward(basis_T, index_T, weights, inputs_T)
         ctx.grid_size = grid_size
-        ctx.grid_min = grid_min
-        ctx.grid_max = grid_max
+        ctx.grid_min = g_min
+        ctx.grid_max = g_max
         
         # Output is [Outputs, Batch], transpose back to [Batch, Outputs]
         return output_T.transpose(0, 1)
@@ -45,14 +48,26 @@ class FusionKANFunction(torch.autograd.Function):
             weights.size(0), weights.size(1), weights.size(2)
         )
         
-        # 2. Inputs Gradient
+        # 2. Inputs, Min, Max Gradients
         grad_inputs = None
-        if ctx.needs_input_grad[0]:
-            grad_inputs_T = _backend.run_backward_inputs(
+        grad_min = None
+        grad_max = None
+        
+        # We calculate input gradients if any input-related tensor needs them
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[3] or ctx.needs_input_grad[4]:
+            # backend returns [grad_inputs_T, grad_min, grad_max]
+            grads = _backend.run_backward_inputs(
                 grad_out_T, inputs_T, weights, 
                 ctx.grid_size, ctx.grid_min, ctx.grid_max
             )
-            # Transpose back to [Batch, Features]
+            
+            grad_inputs_T = grads[0]
+            grad_min = grads[1]
+            grad_max = grads[2]
+            
+            # Transpose inputs back to [Batch, Features]
             grad_inputs = grad_inputs_T.transpose(0, 1)
             
-        return grad_inputs, grad_weights, None, None, None
+        # Return matching forward signature: 
+        # inputs, weights, grid_size, grid_min, grid_max
+        return grad_inputs, grad_weights, None, grad_min, grad_max

@@ -8,6 +8,7 @@
 // 1. __ldg(): Enforced Load Global via Read-Only Cache. Crucial for 'Gather' ops.
 // 2. Fixed 'cudaErrorInvalidValue': Removed Shared Memory usage in backward_weights
 //    to allow large models (Width=1024, Grid=100) without overflowing cache.
+// 3. Learnable Grids: backward_inputs_kernel now computes gradients for min/max.
 // ==========================================================================
 
 // ==========================================================================
@@ -153,8 +154,6 @@ __global__ void backward_weights_kernel(
 
     // Loop over the batch chunk assigned to this block
     int b_end = min(b_start + blockDim.x, nbatch);
-    
-    // Each thread processes one batch item
     int b = b_start + tid;
     
     if (b < b_end) {
@@ -162,8 +161,6 @@ __global__ void backward_weights_kernel(
         T gy = grad_out[out_idx * nbatch + b];
 
         // Iterate over ALL input features
-        // Note: This loops I times. For very wide inputs, we might want to parallelize this dim too,
-        // but for now, this ensures correctness without shared mem limits.
         for (int in_idx = 0; in_idx < nfeat; ++in_idx) {
             
             int flat_idx = in_idx * nbatch + b;
@@ -189,14 +186,15 @@ __global__ void backward_weights_kernel(
     }
 }
 
-// 4. Backward Inputs
-// Computes dL/dX.
+// 4. Backward Inputs (With Learnable Grid Gradients)
 template <typename T>
 __global__ void backward_inputs_kernel(
     const T* __restrict__ grad_out, 
     const T* __restrict__ inputs, 
     const T* __restrict__ weights, 
     T* __restrict__ grad_inputs, 
+    T* __restrict__ grad_min, // NEW: Gradient w.r.t grid_min
+    T* __restrict__ grad_max, // NEW: Gradient w.r.t grid_max
     int nbatch, 
     int nfeat, 
     int nout, 
@@ -205,6 +203,16 @@ __global__ void backward_inputs_kernel(
     T min, 
     T max) 
 {
+    // Shared memory to reduce atomic contention for min/max gradients
+    __shared__ float s_min_grad;
+    __shared__ float s_max_grad;
+    
+    if (threadIdx.x == 0) {
+        s_min_grad = 0.0f;
+        s_max_grad = 0.0f;
+    }
+    __syncthreads();
+
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     
@@ -214,7 +222,7 @@ __global__ void backward_inputs_kernel(
     int flat_idx = i * nbatch + b;
     T x = inputs[flat_idx];
     
-    // If input is out of bounds, gradient is 0
+    // Gradients for inputs outside grid are zero
     if (x < min || x > max) { 
         grad_inputs[flat_idx] = 0.0f; 
         return; 
@@ -235,11 +243,9 @@ __global__ void backward_inputs_kernel(
     T acc = 0.0f;
     for (int o = 0; o < nout; o++) {
         T gy = grad_out[o * nbatch + b];
-        
         int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
         
-        // Dot product of Weights and dBasis
-        // Using __ldg for read-only cache
+        // Dot product of Weights and dBasis using __ldg
         T dot = db[0] * __ldg(&weights[w_ptr + 0]) + 
                 db[1] * __ldg(&weights[w_ptr + 1]) + 
                 db[2] * __ldg(&weights[w_ptr + 2]) + 
@@ -248,9 +254,30 @@ __global__ void backward_inputs_kernel(
         acc += gy * dot;
     }
     
-    // Chain Rule: dL/dx = dL/du * du/dx
-    // du/dx = 1/step
-    grad_inputs[flat_idx] = acc * (static_cast<T>(1.0f) / step);
+    // 1. Store Input Gradient (dL/dx)
+    // Chain Rule: dL/dx = dL/du * du/dx = acc * (1/step)
+    T grad_x = acc * (static_cast<T>(1.0f) / step);
+    grad_inputs[flat_idx] = grad_x;
+
+    // 2. Compute Min/Max Gradients
+    // x_norm = (x - min) / (max - min)
+    // dL/dmin = dL/dx * (x_norm - 1)
+    // dL/dmax = dL/dx * (-x_norm)
+    T x_norm = (x - min) / (max - min);
+    T d_min = grad_x * (x_norm - 1.0f);
+    T d_max = grad_x * (-x_norm);
+
+    // Atomic add to Block Shared Memory first
+    atomicAdd(&s_min_grad, static_cast<float>(d_min));
+    atomicAdd(&s_max_grad, static_cast<float>(d_max));
+
+    __syncthreads();
+
+    // Flush Block Shared Memory to Global Memory (Only Thread 0)
+    if (threadIdx.x == 0) {
+        atomicAdd(grad_min, static_cast<T>(s_min_grad));
+        atomicAdd(grad_max, static_cast<T>(s_max_grad));
+    }
 }
 
 // ==========================================================================
@@ -310,15 +337,10 @@ torch::Tensor run_forward(torch::Tensor basis, torch::Tensor index, torch::Tenso
 
 torch::Tensor run_backward_weights(torch::Tensor grad_out, torch::Tensor basis, torch::Tensor index, int O, int I, int C) {
     int num_batch = grad_out.size(1);
-    
-    // Initialize Gradient to 0
     auto grad_weights = torch::zeros({O, I, C}, grad_out.options());
     
     int threads = 256;
     int chunks = (num_batch + threads - 1) / threads;
-    
-    // Grid: [Batch Chunks, Output Dimensions]
-    // Changed to handle large Width (O) safely
     dim3 grid(chunks, O);
     
     AT_DISPATCH_FLOATING_TYPES(grad_out.scalar_type(), "bw_weights", ([&] {
@@ -333,13 +355,16 @@ torch::Tensor run_backward_weights(torch::Tensor grad_out, torch::Tensor basis, 
     return grad_weights;
 }
 
-torch::Tensor run_backward_inputs(torch::Tensor grad_out, torch::Tensor inputs, torch::Tensor weights, int grid_size, double min, double max) {
+std::vector<torch::Tensor> run_backward_inputs(torch::Tensor grad_out, torch::Tensor inputs, torch::Tensor weights, int grid_size, double min, double max) {
     int num_features = inputs.size(0); 
     int num_batch = inputs.size(1); 
     int num_outputs = weights.size(0); 
     int num_coeffs = weights.size(2);
     
     auto grad_inputs = torch::zeros_like(inputs);
+    // NEW: Gradients for grid bounds (scalars)
+    auto grad_min = torch::zeros({1}, inputs.options());
+    auto grad_max = torch::zeros({1}, inputs.options());
     
     dim3 threads(16, 16);
     dim3 blocks((num_batch+15)/16, (num_features+15)/16);
@@ -350,16 +375,15 @@ torch::Tensor run_backward_inputs(torch::Tensor grad_out, torch::Tensor inputs, 
             inputs.data_ptr<scalar_t>(), 
             weights.data_ptr<scalar_t>(),
             grad_inputs.data_ptr<scalar_t>(), 
-            num_batch, 
-            num_features, 
-            num_outputs, 
-            grid_size, 
-            num_coeffs, 
+            grad_min.data_ptr<scalar_t>(),
+            grad_max.data_ptr<scalar_t>(),
+            num_batch, num_features, num_outputs, grid_size, num_coeffs, 
             static_cast<scalar_t>(min), 
             static_cast<scalar_t>(max)
         );
     }));
-    return grad_inputs;
+    // Return list: [grad_inputs, grad_min, grad_max]
+    return {grad_inputs, grad_min, grad_max};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
