@@ -7,37 +7,33 @@ import gc
 import os
 import sys
 
-# --- 🔧 FIX IMPORTS ---
-# Add the project root directory to Python path so we can find 'kan' folder
+# --- SETUP ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 1. Import FusionKAN (Your Library)
+# 1. Import FusionKAN
 try:
     from fusion_kan import FusionKANLayer
     print("✅ FusionKAN imported successfully.")
 except ImportError:
     raise ImportError("Please install fusion_kan first via 'pip install .'")
 
-# 2. Import Original KAN (From local folder)
-# Assuming the provided files are in a folder named 'kan' in the python path
+# 2. Import Original KAN (MultKAN class handles both versions)
 try:
     from kan.MultKAN import MultKAN
     print("✅ Original KAN code imported successfully.")
 except ImportError:
-    print("⚠️ Could not import original 'kan' package. Please ensure the provided files are in a folder named 'kan'.")
-    # Mocking for demonstration if files aren't set up, but in your case, they will be.
+    print("⚠️ Could not import original 'kan' package.")
     MultKAN = None
 
-DEVICE = 'cuda'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 RESULTS_FILE = "fusion_kan_paper_results.csv"
 
 # --- DATA GENERATION ---
 def get_data(n_samples=10000):
     # Task: f(x,y) = exp(sin(pi*x) + y^2)
-    # A standard smooth function from the KAN paper
     x = torch.rand(n_samples, 2).to(DEVICE) * 2 - 1
     y = torch.exp(torch.sin(torch.pi * x[:, 0]) + x[:, 1]**2)
     return x, y.unsqueeze(1)
@@ -48,7 +44,7 @@ def run_trial(model_type, config, x_train, y_train):
     grid = config['grid']
     k = 3
     batch_size = config['batch']
-    steps = 100 # Short run for speed/mem, Long run for convergence
+    steps = 100 # Short run for speed/mem
     if config['type'] == 'convergence': steps = 1000
     
     # 1. Initialize Model
@@ -57,21 +53,36 @@ def run_trial(model_type, config, x_train, y_train):
     gc.collect()
     
     try:
-        if model_type == "Original":
-            # symbolic_enabled=False for fair numeric comparison
+        if model_type == "PyKAN":
+            # ORIGINAL KAN (Paper 1)
+            # Pure splines, no multiplication nodes.
+            # mult_arity=0 forces the original behavior.
             model = MultKAN(width=[2, width, 1], grid=grid, k=k, 
+                           mult_arity=0, 
                            symbolic_enabled=False, device=DEVICE)
-        else:
+
+        elif model_type == "MultKAN":
+            # KAN 2.0 (Paper 2)
+            # Includes multiplication nodes.
+            # Width format is [[n_sum, n_mult], ...]
+            # We add 5 multiplication nodes to the hidden layer for comparison
+            m_width = [[2,0], [width, 5], [1,0]] 
+            model = MultKAN(width=m_width, grid=grid, k=k, 
+                           mult_arity=2, 
+                           symbolic_enabled=False, device=DEVICE)
+            
+        else: 
+            # FUSION KAN (Ours)
             model = nn.Sequential(
-                FusionKANLayer(2, width, grid, k),
-                FusionKANLayer(width, 1, grid, k, is_output=True)
+                FusionKANLayer(2, width, grid_size=grid, spline_order=k),
+                FusionKANLayer(width, 1, grid_size=grid, spline_order=k, is_output=True)
             ).to(DEVICE)
             
         optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
         loss_fn = nn.MSELoss()
         
-        # Warmup
-        _ = model(x_train[:10])
+        # Warmup (Optional, mainly for JIT compilation)
+        # _ = model(x_train[:10])
         torch.cuda.synchronize()
         
         # 2. Training Loop
@@ -82,8 +93,8 @@ def run_trial(model_type, config, x_train, y_train):
             indices = torch.randperm(x_train.size(0))[:batch_size]
             bx, by = x_train[indices], y_train[indices]
             
-            # Original KAN manual grid update (essential for convergence)
-            if model_type == "Original" and step % 50 == 0 and step > 0:
+            # Both PyKAN and MultKAN require manual grid updates
+            if model_type in ["PyKAN", "MultKAN"] and step % 50 == 0 and step > 0:
                 model.update_grid(bx)
                 
             optimizer.zero_grad()
@@ -111,7 +122,7 @@ def run_trial(model_type, config, x_train, y_train):
             "ms_per_step": avg_iter_ms,
             "peak_mem_mb": peak_mem_mb,
             "final_loss": final_loss,
-            "loss_curve": losses # Only for convergence test
+            "loss_curve": losses
         }
         
     except RuntimeError as e:
@@ -119,6 +130,8 @@ def run_trial(model_type, config, x_train, y_train):
             return {"status": "OOM"}
         else:
             return {"status": "error", "msg": str(e)}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
 
 # --- EXPERIMENTS ---
 
@@ -126,54 +139,62 @@ def run_experiments():
     results = []
     x, y = get_data(20000)
     
+    # List of models to compare
+    # PyKAN = Original KAN (Paper 1)
+    # MultKAN = KAN 2.0 (Paper 2)
+    models_to_test = ["FusionKAN", "PyKAN", "MultKAN"]
+    
     print("--- 1. GRID SCALING EXPERIMENT (Memory Complexity) ---")
-    # Hypothesis: Original KAN memory explodes with Grid size. FusionKAN is constant.
     grids = [10, 50, 100, 200, 500]
     fixed_width = 256
     fixed_batch = 4096
     
     for g in grids:
         conf = {'width': fixed_width, 'grid': g, 'batch': fixed_batch, 'type': 'grid_exp'}
+        print(f"--- Running Grid={g} ---")
         
-        print(f"Running Grid={g}...")
-        
-        # Fusion
-        res_f = run_trial("Fusion", conf, x, y)
-        results.append({**conf, "model": "FusionKAN", **res_f})
-        
-        # Original
-        res_o = run_trial("Original", conf, x, y)
-        results.append({**conf, "model": "Original", **res_o})
+        for m_name in models_to_test:
+            # Skip MultKAN for grid scaling if you want to save time (it behaves like PyKAN for memory)
+            if m_name == "MultKAN" and g > 50: continue 
+
+            print(f"Testing {m_name}...")
+            res = run_trial(m_name, conf, x, y)
+            
+            if res['status'] == 'success':
+                print(f"  > Time: {res['time']:.2f}s | Mem: {res['peak_mem_mb']:.0f}MB")
+            else:
+                print(f"  > {res['status']}")
+            
+            results.append({**conf, "model": m_name, **res})
 
     print("\n--- 2. WIDTH SCALING EXPERIMENT (Computational Throughput) ---")
-    # Hypothesis: FusionKAN has much lower latency per step at large widths.
     widths = [64, 128, 256, 512, 1024, 2048]
     fixed_grid = 20
     
     for w in widths:
         conf = {'width': w, 'grid': fixed_grid, 'batch': fixed_batch, 'type': 'width_exp'}
+        print(f"--- Running Width={w} ---")
         
-        print(f"Running Width={w}...")
-        
-        res_f = run_trial("Fusion", conf, x, y)
-        results.append({**conf, "model": "FusionKAN", **res_f})
-        
-        res_o = run_trial("Original", conf, x, y)
-        results.append({**conf, "model": "Original", **res_o})
+        for m_name in models_to_test:
+            print(f"Testing {m_name}...")
+            res = run_trial(m_name, conf, x, y)
+            
+            if res['status'] == 'success':
+                print(f"  > Time: {res['time']:.2f}s | Speed: {res['ms_per_step']:.2f}ms/step")
+            else:
+                print(f"  > {res['status']}")
+            
+            results.append({**conf, "model": m_name, **res})
 
     print("\n--- 3. CONVERGENCE CHECK ---")
-    # Hypothesis: FusionKAN (Learnable Grid) converges as smooth/fast as Original (Adaptive Grid)
+    # Smaller batch for convergence to allow more steps
     conf = {'width': 64, 'grid': 20, 'batch': 1024, 'type': 'convergence'}
     
-    print("Running Convergence Fusion...")
-    res_f = run_trial("Fusion", conf, x, y)
-    
-    print("Running Convergence Original...")
-    res_o = run_trial("Original", conf, x, y)
-    
-    # Save loss curves separately
-    np.save("loss_fusion.npy", res_f['loss_curve'])
-    np.save("loss_original.npy", res_o['loss_curve'])
+    for m_name in models_to_test:
+        print(f"Running Convergence {m_name}...")
+        res = run_trial(m_name, conf, x, y)
+        if res['status'] == 'success':
+            np.save(f"loss_{m_name}.npy", res['loss_curve'])
 
     # Save CSV
     df = pd.DataFrame(results)
