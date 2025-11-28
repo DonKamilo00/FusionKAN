@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import time
@@ -19,7 +17,12 @@ try:
     from fusion_kan import FusionKANLayer
     print("✅ FusionKAN imported successfully.")
 except ImportError:
-    raise ImportError("Please install fusion_kan first via 'pip install .'")
+    try:
+        import fusion_kan
+        from fusion_kan import FusionKANLayer
+        print("✅ FusionKAN imported successfully (direct package).")
+    except ImportError:
+        raise ImportError("Please install fusion_kan first via 'pip install .'")
 
 # Import Original KAN
 try:
@@ -46,29 +49,13 @@ def train_model(model_name, model, x, y, steps=500, batch_size=512):
     torch.cuda.synchronize()
     start_time = time.time()
     
-    # Identify FusionKAN layers for grid updates
-    fusion_layers = []
-    if "Fusion" in model_name:
-        for m in model.modules():
-            if isinstance(m, FusionKANLayer):
-                fusion_layers.append(m)
-    
     for step in range(steps):
         indices = torch.randperm(x.shape[0])[:batch_size]
         batch_x = x[indices]
         batch_y = y[indices]
         
-        # --- DYNAMIC GRID UPDATE ---
-        # Update grid bounds every 50 steps to adapt to layer activation shifts
-        if fusion_layers and step % 50 == 0:
-            current_input = batch_x
-            for layer in model:
-                if isinstance(layer, FusionKANLayer):
-                    layer.update_grid(current_input)
-                # Propagate input for next layer stats
-                # Note: This simple loop assumes Sequential model structure
-                current_input = layer(current_input)
-        # ---------------------------
+        # --- NOTE: No manual grid update needed for FusionKAN ---
+        # The grid bounds are now learnable parameters updated by the optimizer.
 
         optimizer.zero_grad()
         pred = model(batch_x)
@@ -90,7 +77,6 @@ def train_model(model_name, model, x, y, steps=500, batch_size=512):
 
 def run_benchmark():
     # --- STRESS TEST CONFIG ---
-    # Increased width to demonstrate O(N) vs O(G) memory scaling
     WIDTH = [2, 1024, 1] 
     GRID = 100
     K = 3
@@ -120,7 +106,6 @@ def run_benchmark():
             torch.cuda.empty_cache()
         except Exception as e:
             print(f"Original KAN failed (likely OOM): {e}")
-            # If OOM, record null results to show failure in plot
             results['Original KAN'] = {'time': 0, 'mem': 0, 'loss': []}
 
     # 2. Train FusionKAN
