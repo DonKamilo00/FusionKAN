@@ -6,14 +6,29 @@ import numpy as np
 import gc
 import os
 
-# --- IMPORTS ---
+# --- 🔧 FIX IMPORTS ---
+# Add the project root directory to Python path so we can find 'kan' folder
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 1. Import FusionKAN (Your Library)
 try:
     from fusion_kan import FusionKANLayer
+    print("✅ FusionKAN imported successfully.")
+except ImportError:
+    raise ImportError("Please install fusion_kan first via 'pip install .'")
+
+# 2. Import Original KAN (From local folder)
+# Assuming the provided files are in a folder named 'kan' in the python path
+try:
     from kan.MultKAN import MultKAN
-except ImportError as e:
-    print(f"Error importing libraries: {e}")
-    print("Ensure fusion_kan is installed and 'kan' folder is in path.")
-    exit(1)
+    print("✅ Original KAN code imported successfully.")
+except ImportError:
+    print("⚠️ Could not import original 'kan' package. Please ensure the provided files are in a folder named 'kan'.")
+    # Mocking for demonstration if files aren't set up, but in your case, they will be.
+    MultKAN = None
 
 DEVICE = 'cuda'
 RESULTS_FILE = "fusion_kan_paper_results.csv"
