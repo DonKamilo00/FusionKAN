@@ -105,7 +105,17 @@ __global__ void backward_weights_kernel(const T* __restrict__ grad_out, const T*
     __syncthreads();
     
     for (int t = tid; t < nout * ncoeffs; t += blockDim.x) {
-        int o = t / ncoeffs; int c = t % ncoeffs;
+        int o = t / ncoeffs; 
+        int c = t % ncoeffs;
+        
+        // Calculate the global index for grad_weights[o, i, c]
+        // Tensor shape is [nout, nfeat, ncoeffs]
+        // 'i' is the feature index (blockIdx.y)
+        int global_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + c;
+        
+        // Atomic add is required because multiple blocks (chunks of the batch) 
+        // contribute to the same weight gradient
+        atomicAdd(&grad_weights[global_ptr], static_cast<T>(s_accum[t]));
     }
 }
 
