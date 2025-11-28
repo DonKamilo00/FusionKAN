@@ -6,8 +6,8 @@
 // ==========================================================================
 // RESEARCH ENGINEER NOTES:
 // 1. __ldg(): Enforced Load Global via Read-Only Cache. Crucial for 'Gather' ops.
-// 2. atomicAdd: Fixed the missing write-back in backward pass.
-// 3. __forceinline__: Ensure math helpers don't add function call overhead.
+// 2. Fixed 'cudaErrorInvalidValue': Removed Shared Memory usage in backward_weights
+//    to allow large models (Width=1024, Grid=100) without overflowing cache.
 // ==========================================================================
 
 // ==========================================================================
@@ -39,7 +39,6 @@ __device__ __forceinline__ void compute_cubic_derivative(T u, T* db) {
 
 // 1. Basis Kernel
 // Computes the 4 non-zero basis values for every input element.
-// Complexity: O(N)
 template <typename T>
 __global__ void basis_kernel(
     const T* __restrict__ inputs, 
@@ -128,9 +127,9 @@ __global__ void forward_kernel(
     output[o * nbatch + b] = acc;
 }
 
-// 3. Backward Weights
-// Computes dL/dW. 
-// OPTIMIZATION: Uses Shared Memory reduction to minimize Global Atomics.
+// 3. Backward Weights (Fixed for Large Width/Grid)
+// Removed Shared Memory optimization to prevent overflow on large models.
+// Uses direct global atomic adds. 
 template <typename T>
 __global__ void backward_weights_kernel(
     const T* __restrict__ grad_out, 
@@ -142,71 +141,51 @@ __global__ void backward_weights_kernel(
     int nout, 
     int ncoeffs) 
 {
-    // Shared memory for this block's accumulation
-    extern __shared__ float s_accum[];
+    // We parallelize over:
+    // Block X: Batch Chunks
+    // Block Y: Output Dimensions
     
-    int i = blockIdx.y;   // Feature index
-    int chunk = blockIdx.x; // Batch chunk index
+    int b_start = blockIdx.x * blockDim.x;
+    int out_idx = blockIdx.y; // One block per output neuron
     int tid = threadIdx.x;
+
+    if (out_idx >= nout) return;
+
+    // Loop over the batch chunk assigned to this block
+    int b_end = min(b_start + blockDim.x, nbatch);
     
-    // 1. Initialize shared memory to 0
-    // Each block handles specific Feature 'i'. Shared mem size = [nout * ncoeffs]
-    for (int t = tid; t < nout * ncoeffs; t += blockDim.x) {
-        s_accum[t] = 0.0f;
-    }
-    __syncthreads();
+    // Each thread processes one batch item
+    int b = b_start + tid;
     
-    // 2. Accumulate gradients over the batch chunk
-    int stride = blockDim.x * gridDim.x; // Global stride if needed, but here we process specific chunks
-    // Actually, logical logic: chunks split nbatch.
-    
-    int start_b = chunk * blockDim.x;
-    int end_b = min(start_b + blockDim.x, nbatch);
-    
-    // Loop over this block's assigned batch elements
-    // Note: To optimize, we loop stride based on blockDim inside the chunk
-    for (int b_offset = tid; start_b + b_offset < end_b; b_offset += blockDim.x) {
-        int b = start_b + b_offset;
-        
-        int flat_idx = i * nbatch + b;
-        int basis_ptr = flat_idx * 4;
-        
-        // Load basis for this input
-        T b0 = basis[basis_ptr + 0]; 
-        T b1 = basis[basis_ptr + 1]; 
-        T b2 = basis[basis_ptr + 2]; 
-        T b3 = basis[basis_ptr + 3];
-        
-        int k = index[flat_idx]; // Which grid coefficient
-        
-        // For every output dimension
-        for (int o = 0; o < nout; o++) {
-            T gy = grad_out[o * nbatch + b];
+    if (b < b_end) {
+        // Load Gradient for this batch item and output neuron
+        T gy = grad_out[out_idx * nbatch + b];
+
+        // Iterate over ALL input features
+        // Note: This loops I times. For very wide inputs, we might want to parallelize this dim too,
+        // but for now, this ensures correctness without shared mem limits.
+        for (int in_idx = 0; in_idx < nfeat; ++in_idx) {
             
-            // Shared memory pointer: Row 'o', offset 'k'
-            int s_ptr = (o * ncoeffs) + k;
-            
-            // Atomic Add to Shared Memory
-            // (Much faster than global atomic add)
-            atomicAdd(&s_accum[s_ptr + 0], static_cast<float>(gy * b0));
-            atomicAdd(&s_accum[s_ptr + 1], static_cast<float>(gy * b1));
-            atomicAdd(&s_accum[s_ptr + 2], static_cast<float>(gy * b2));
-            atomicAdd(&s_accum[s_ptr + 3], static_cast<float>(gy * b3));
+            int flat_idx = in_idx * nbatch + b;
+            int k = index[flat_idx];
+            int basis_ptr = flat_idx * 4;
+
+            // Load Basis
+            T b0 = basis[basis_ptr + 0];
+            T b1 = basis[basis_ptr + 1];
+            T b2 = basis[basis_ptr + 2];
+            T b3 = basis[basis_ptr + 3];
+
+            // Calculate Global Weight Pointer
+            // Weights: [Out, In, Coeffs]
+            int w_base = (out_idx * nfeat * ncoeffs) + (in_idx * ncoeffs) + k;
+
+            // Atomic Add to Global Memory
+            atomicAdd(&grad_weights[w_base + 0], gy * b0);
+            atomicAdd(&grad_weights[w_base + 1], gy * b1);
+            atomicAdd(&grad_weights[w_base + 2], gy * b2);
+            atomicAdd(&grad_weights[w_base + 3], gy * b3);
         }
-    }
-    __syncthreads();
-    
-    // 3. FLUSH TO GLOBAL MEMORY (The Critical Fix)
-    for (int t = tid; t < nout * ncoeffs; t += blockDim.x) {
-        int o = t / ncoeffs; 
-        int c = t % ncoeffs;
-        
-        // Global pointer: [Output, Feature, Coeff]
-        int global_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + c;
-        
-        // Atomic Add to Global Memory
-        // Required because multiple blocks (chunks) handle the same (Feature, Output)
-        atomicAdd(&grad_weights[global_ptr], static_cast<T>(s_accum[t]));
     }
 }
 
@@ -260,6 +239,7 @@ __global__ void backward_inputs_kernel(
         int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
         
         // Dot product of Weights and dBasis
+        // Using __ldg for read-only cache
         T dot = db[0] * __ldg(&weights[w_ptr + 0]) + 
                 db[1] * __ldg(&weights[w_ptr + 1]) + 
                 db[2] * __ldg(&weights[w_ptr + 2]) + 
@@ -334,21 +314,15 @@ torch::Tensor run_backward_weights(torch::Tensor grad_out, torch::Tensor basis, 
     // Initialize Gradient to 0
     auto grad_weights = torch::zeros({O, I, C}, grad_out.options());
     
-    // We launch:
-    // Grid Y: Input Features (I)
-    // Grid X: Batch Chunks (nbatch / 256)
     int threads = 256;
     int chunks = (num_batch + threads - 1) / threads;
     
-    dim3 grid(chunks, I);
-    
-    // Shared Memory Size: Outputs * Coeffs * sizeof(float)
-    // Careful: If O*C is large, this might exceed shared mem limits. 
-    // FusionKAN usually has small O (64-128) and C (8-10).
-    int shared_mem = O * C * sizeof(float);
+    // Grid: [Batch Chunks, Output Dimensions]
+    // Changed to handle large Width (O) safely
+    dim3 grid(chunks, O);
     
     AT_DISPATCH_FLOATING_TYPES(grad_out.scalar_type(), "bw_weights", ([&] {
-        backward_weights_kernel<scalar_t><<<grid, threads, shared_mem>>>(
+        backward_weights_kernel<scalar_t><<<grid, threads>>>(
             grad_out.data_ptr<scalar_t>(), 
             basis.data_ptr<scalar_t>(), 
             index.data_ptr<int>(),
