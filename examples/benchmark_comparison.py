@@ -1,3 +1,5 @@
+--- START OF FILE benchmark_comparison.py ---
+
 import torch
 import torch.nn as nn
 import time
@@ -44,11 +46,30 @@ def train_model(model_name, model, x, y, steps=500, batch_size=512):
     torch.cuda.synchronize()
     start_time = time.time()
     
+    # Identify FusionKAN layers for grid updates
+    fusion_layers = []
+    if "Fusion" in model_name:
+        for m in model.modules():
+            if isinstance(m, FusionKANLayer):
+                fusion_layers.append(m)
+    
     for step in range(steps):
         indices = torch.randperm(x.shape[0])[:batch_size]
         batch_x = x[indices]
         batch_y = y[indices]
         
+        # --- DYNAMIC GRID UPDATE ---
+        # Update grid bounds every 50 steps to adapt to layer activation shifts
+        if fusion_layers and step % 50 == 0:
+            current_input = batch_x
+            for layer in model:
+                if isinstance(layer, FusionKANLayer):
+                    layer.update_grid(current_input)
+                # Propagate input for next layer stats
+                # Note: This simple loop assumes Sequential model structure
+                current_input = layer(current_input)
+        # ---------------------------
+
         optimizer.zero_grad()
         pred = model(batch_x)
         loss = loss_fn(pred, batch_y)
@@ -68,42 +89,51 @@ def train_model(model_name, model, x, y, steps=500, batch_size=512):
     return total_time, peak_mem, losses
 
 def run_benchmark():
-    # --- STRATEGY TO BEAT ORIGINAL KAN ---
-    WIDTH = [2, 64, 1]
-    
-    # GRID=20 on range [-2, 2] gives step size 0.2
-    # This matches Original KAN (Grid 10 on range [-1, 1] => step size 0.2)
-    # This recovers accuracy while keeping parameters low.
-    GRID = 20
+    # --- STRESS TEST CONFIG ---
+    # Increased width to demonstrate O(N) vs O(G) memory scaling
+    WIDTH = [2, 1024, 1] 
+    GRID = 100
     K = 3
-    STEPS = 500
-    BATCH = 2048
+    STEPS = 200
+    BATCH = 8192
     
-    x, y = generate_data(n_samples=20000)
+    print(f"Benchmark Config: Width={WIDTH}, Grid={GRID}, Batch={BATCH}")
+    
+    x, y = generate_data(n_samples=50000)
     results = {}
     
     # 1. Train Original KAN
     if MultKAN is not None:
         try:
-            # Original KAN defaults to grid=10 usually
-            orig_model = MultKAN(width=WIDTH, grid=10, k=K, symbolic_enabled=False, device=DEVICE)
+            print("Initializing Original KAN...")
+            # symbolic_enabled=False to compare numerical engine only
+            orig_model = MultKAN(width=WIDTH, grid=GRID, k=K, symbolic_enabled=False, device=DEVICE)
+            
+            # Reset peak memory before tracking
+            torch.cuda.reset_peak_memory_stats()
             t_orig, m_orig, l_orig = train_model("Original KAN", orig_model, x, y, steps=STEPS, batch_size=BATCH)
+            
             if t_orig > 0:
                 results['Original KAN'] = {'time': t_orig, 'mem': m_orig, 'loss': l_orig}
+            
             del orig_model
             torch.cuda.empty_cache()
         except Exception as e:
-            print(f"Original KAN failed: {e}")
+            print(f"Original KAN failed (likely OOM): {e}")
+            # If OOM, record null results to show failure in plot
+            results['Original KAN'] = {'time': 0, 'mem': 0, 'loss': []}
 
-    # 2. Train FusionKAN (Pure Mode)
+    # 2. Train FusionKAN
+    print("Initializing FusionKAN...")
     fused_model = nn.Sequential(
-        FusionKANLayer(2, 64, grid_size=GRID, spline_order=K, use_node_activation=False),
-        FusionKANLayer(64, 1, grid_size=GRID, spline_order=K, is_output=True)
+        FusionKANLayer(2, 1024, grid_size=GRID, spline_order=K, use_node_activation=False),
+        FusionKANLayer(1024, 1, grid_size=GRID, spline_order=K, is_output=True)
     ).to(DEVICE)
     
-    # Warmup kernel
+    # Warmup kernel compilation
     _ = fused_model(x[:10])
     
+    torch.cuda.reset_peak_memory_stats()
     t_fused, m_fused, l_fused = train_model("FusionKAN", fused_model, x, y, steps=STEPS, batch_size=BATCH)
     results['FusionKAN'] = {'time': t_fused, 'mem': m_fused, 'loss': l_fused}
 
@@ -112,21 +142,29 @@ def run_benchmark():
 def plot_results(results):
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
     names = list(results.keys())
-    times = [results[n]['time'] for n in names]
-    mems = [results[n]['mem'] for n in names]
     
+    # Handle cases where Original KAN might have failed
+    times = []
+    mems = []
+    valid_names = []
+    
+    for n in names:
+        if results[n]['time'] > 0:
+            times.append(results[n]['time'])
+            mems.append(results[n]['mem'])
+            valid_names.append(n)
+        else:
+            print(f"Skipping {n} in bar charts due to failure.")
+            
     # Time
-    ax1.bar(names, times, color=['#FF5733', '#33FF57'])
+    ax1.bar(valid_names, times, color=['#FF5733', '#33FF57'])
     ax1.set_title('Training Time (Lower is Better)')
     ax1.set_ylabel('Seconds')
     for i, v in enumerate(times):
         ax1.text(i, v, f"{v:.2f}s", ha='center', va='bottom')
-    if len(names) > 1:
-        speedup = results['Original KAN']['time'] / results['FusionKAN']['time']
-        ax1.text(0.5, max(times)*0.5, f"{speedup:.1f}x Speedup", ha='center', bbox=dict(facecolor='white'))
 
     # Memory
-    ax2.bar(names, mems, color=['#FF5733', '#33FF57'])
+    ax2.bar(valid_names, mems, color=['#FF5733', '#33FF57'])
     ax2.set_title('Peak VRAM (Lower is Better)')
     ax2.set_ylabel('MB')
     for i, v in enumerate(mems):
@@ -134,7 +172,9 @@ def plot_results(results):
 
     # Loss
     for name in names:
-        ax3.plot(results[name]['loss'], label=name)
+        if len(results[name]['loss']) > 0:
+            ax3.plot(results[name]['loss'], label=name)
+            
     ax3.set_title('Convergence (MSE Loss)')
     ax3.set_yscale('log')
     ax3.legend()

@@ -1,3 +1,5 @@
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +10,7 @@ class FusionKANLayer(nn.Module):
     def __init__(self, in_features, out_features, grid_size=5, spline_order=3, 
                  scale_noise=0.1, scale_base=1.0, scale_spline=1.0, 
                  base_activation=nn.SiLU, grid_eps=0.02, 
-                 grid_range=[-2, 2], # <--- OPTIMIZED: Covers 95% of Normal Dist
+                 grid_range=[-2, 2], 
                  is_output=False,
                  use_node_activation=False):
         super().__init__()
@@ -16,8 +18,11 @@ class FusionKANLayer(nn.Module):
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
+        
+        # Grid bounds (will be updated dynamically)
         self.grid_min = grid_range[0]
         self.grid_max = grid_range[1]
+        
         self.scale_spline = scale_spline
         self.is_output = is_output
         self.use_node_activation = use_node_activation
@@ -34,14 +39,28 @@ class FusionKANLayer(nn.Module):
         self.scale_base = nn.Parameter(torch.ones(out_features) * scale_base)
         self.scale_spline = nn.Parameter(torch.ones(out_features) * scale_spline)
         
-        # --- CRITICAL FIX: Affine=False ---
-        # We don't want BatchNorm learning a shift/scale while Splines also learn a shift/scale.
-        # This locks the input to N(0,1) so the splines have a stationary target.
+        # Normalization
+        # affine=False to ensure inputs are roughly N(0,1), enabling static grid usage 
+        # for simple cases, while update_grid handles distribution shifts.
         self.input_norm = nn.BatchNorm1d(in_features, affine=False)
         
         self.layer_norm = nn.LayerNorm(out_features)
         self.prelu = nn.PReLU()
         self.base_activation = base_activation()
+
+    @torch.no_grad()
+    def update_grid(self, x, margin=0.01):
+        """
+        Dynamically adapt grid bounds to input distribution.
+        This prevents the 'dead neuron' problem where data falls outside [-2, 2].
+        """
+        batch_min = x.min().item()
+        batch_max = x.max().item()
+        
+        # Momentum update to avoid jitter
+        momentum = 0.99
+        self.grid_min = momentum * self.grid_min + (1 - momentum) * (batch_min - margin)
+        self.grid_max = momentum * self.grid_max + (1 - momentum) * (batch_max + margin)
 
     def forward(self, x):
         # 1. Norm
@@ -53,6 +72,8 @@ class FusionKANLayer(nn.Module):
         
         # 3. Spline
         if x.device.type == 'cuda':
+            # Note: We pass the scalar values of grid_min/max. 
+            # If update_grid was called, these values are fresh.
             spline_output = FusionKANFunction.apply(
                 x_norm, 
                 self.spline_weight, 
