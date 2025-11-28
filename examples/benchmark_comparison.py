@@ -94,7 +94,7 @@ def run_benchmark():
     WIDTH = [2, 1024, 1] 
     GRID = 100
     K = 3
-    STEPS = 200
+    STEPS = 1000
     BATCH = 8192
     
     print(f"Benchmark Config: Width={WIDTH}, Grid={GRID}, Batch={BATCH}")
