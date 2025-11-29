@@ -23,6 +23,12 @@ Unlike standard implementations that require manual grid updates to handle data 
 
 Benchmarks run on NVIDIA T4, Float32, Batch Size 4096.
 
+### Experiment 1 2D function
+
+The benchmark is trying to learn a specific 2D function:
+
+$$ f(x, y) = \exp(\sin(\pi x) + y^2) $$
+
 | Model | Grid Size ($G$) | Peak VRAM | Time per Step |
 | :--- | :--- | :--- | :--- |
 | **PyKAN / MultKAN** | 200 | 12.5 GB | 565 ms |
