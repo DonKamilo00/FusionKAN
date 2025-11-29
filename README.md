@@ -23,7 +23,7 @@ Unlike standard implementations that require manual grid updates to handle data 
 
 Benchmarks run on NVIDIA T4, Float32, Batch Size 4096.
 
-### Experiment 1 2D function
+### Experiment 1 Memory Scalability and Computational Throughput at High Grid Resolutions
 
 The benchmark is trying to learn a specific 2D function:
 
