@@ -10,12 +10,10 @@ import os
 import sys
 
 # --- IMPORTS ---
-
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
-
 
 try:
     from fusion_kan import FusionKANLayer
@@ -24,7 +22,7 @@ except ImportError:
     print("Please install fusion_kan and ensure 'kan' folder is present.")
     exit(1)
 
-DEVICE = 'cuda'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.set_default_dtype(torch.float32)
 
 # ==========================================
@@ -41,7 +39,6 @@ def get_bessel_data(n_samples=10000):
 # ==========================================
 def get_gear_sdf_data(n_samples=100000):
     # Create a complex 2D shape (Gear)
-    # x, y in [-1, 1]
     points = torch.rand(n_samples, 2).to(DEVICE) * 2 - 1
     
     # Convert to polar
@@ -52,8 +49,7 @@ def get_gear_sdf_data(n_samples=100000):
     teeth = 8
     target_radius = 0.5 + 0.1 * torch.sin(teeth * theta)
     
-    # SDF = dist to center - target_radius (Simplified, not exact Euclidean SDF but valid implicit field)
-    # Negative = Inside, Positive = Outside
+    # SDF = dist to center - target_radius
     sdf = r - target_radius
     
     return points, sdf.unsqueeze(1)
@@ -64,8 +60,10 @@ def get_gear_sdf_data(n_samples=100000):
 def build_model(model_type, input_dim, hidden_dim, grid_size, k=3):
     if model_type == "PyKAN":
         # Standard KAN from Paper 1 (No Mul)
+        # mult_arity=0 forces pure B-spline layers
         return MultKAN(width=[input_dim, hidden_dim, 1], grid=grid_size, k=k, 
                       mult_arity=0, symbolic_enabled=False, device=DEVICE)
+    
     elif model_type == "FusionKAN":
         # Our CUDA KAN
         return nn.Sequential(
@@ -81,10 +79,18 @@ def train_and_evaluate(task_name, model_type, x_train, y_train, config):
     print(f"[{task_name}] Training {model_type}...")
     
     model = build_model(model_type, x_train.shape[1], config['width'], config['grid'])
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
     
-    # Scheduler for SDF to get sharp edges
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['steps'])
+    # --- HYPERPARAMETER ADJUSTMENT ---
+    # PyKAN is numerically unstable at high grid sizes (G=200).
+    # We reduce LR by 10x to prevent NaN divergence.
+    lr = config['lr']
+    if model_type == "PyKAN":
+        lr = lr * 0.1
+        
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Scheduler for fine-tuning
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
     loss_fn = nn.MSELoss()
     
     dataset = TensorDataset(x_train, y_train)
@@ -97,14 +103,24 @@ def train_and_evaluate(task_name, model_type, x_train, y_train, config):
     for epoch in range(config['epochs']):
         epoch_loss = 0
         for bx, by in loader:
-            # Manual Grid Update for PyKAN
+            # Manual Grid Update for PyKAN (Essential for adaptation)
             if model_type == "PyKAN" and epoch % 5 == 0 and epoch > 0:
                 model.update_grid(bx)
             
             optimizer.zero_grad()
             pred = model(bx)
             loss = loss_fn(pred, by)
+            
+            if torch.isnan(loss):
+                print("⚠️ Loss is NaN! Stopping early.")
+                break
+                
             loss.backward()
+            
+            # --- GRADIENT CLIPPING ---
+            # Essential for high-grid B-splines to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             epoch_loss += loss.item()
         
@@ -125,7 +141,8 @@ def train_and_evaluate(task_name, model_type, x_train, y_train, config):
 
 def run_benchmarks():
     # 1. BESSEL EXPERIMENT (High Frequency Fitting)
-    # We use a very high grid size (G=200) to prove FusionKAN handles it easily
+    # Grid=200 is very high resolution. FusionKAN handles this easily via CUDA.
+    # PyKAN needs clipping and lower LR to survive.
     bessel_config = {'width': 64, 'grid': 200, 'lr': 0.01, 'epochs': 100, 'steps': 100, 'batch': 512}
     x_b, y_b = get_bessel_data()
     
@@ -145,11 +162,11 @@ def run_benchmarks():
              time_orig=time_bo, time_fusion=time_bf)
 
     # 2. SDF EXPERIMENT (2D Shape Representation)
-    # Large batch size (8192) to stress throughput
+    # Large batch size (8192) to stress throughput.
     sdf_config = {'width': 64, 'grid': 50, 'lr': 0.005, 'epochs': 50, 'steps': 50, 'batch': 8192}
     x_s, y_s = get_gear_sdf_data(200000) # 200k points
     
-    # Train Fusion Only (To generate the cool visual, PyKAN is too slow for this res/batch)
+    # Train Fusion Only (PyKAN is too slow for this loop in reasonable time)
     model_sf, hist_sf, time_sf = train_and_evaluate("SDF", "FusionKAN", x_s, y_s, sdf_config)
     
     # Generate Inference Grid for Visualization
