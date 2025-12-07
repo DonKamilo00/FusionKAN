@@ -76,3 +76,43 @@ class FusionKANLayer(nn.Module):
             return y
         
         return self.prelu(self.layer_norm(y))
+
+    @torch.no_grad()
+    def upscale_grid(self, new_grid_size):
+        """
+        Transfers weights from the current grid size to a larger grid size 
+        via linear interpolation. Crucial for Coarse-to-Fine training.
+        """
+        if new_grid_size <= self.grid_size:
+            print(f"Skipping upscale: {new_grid_size} <= {self.grid_size}")
+            return
+
+        # Weights shape: [Out, In, Coeffs]
+        # Coeffs = grid_size + spline_order
+        old_coeffs = self.spline_weight.data
+        out_dim, in_dim, old_num = old_coeffs.shape
+        
+        # Calculate new number of coefficients
+        new_num = new_grid_size + self.spline_order
+        
+        # We treat the coefficients as a 1D signal and interpolate them.
+        # Reshape to [1, Out*In, Old_Coeffs] for F.interpolate (expects [N, C, L])
+        flat_coeffs = old_coeffs.view(1, out_dim * in_dim, old_num)
+        
+        # Interpolate
+        # mode='linear' approximates B-spline subdivision fairly well for training
+        new_flat_coeffs = F.interpolate(
+            flat_coeffs, 
+            size=new_num, 
+            mode='linear', 
+            align_corners=True
+        )
+        
+        # Reshape back to [Out, In, New_Coeffs]
+        new_coeffs = new_flat_coeffs.view(out_dim, in_dim, new_num)
+        
+        # Update Parameter
+        self.spline_weight = nn.Parameter(new_coeffs)
+        self.grid_size = new_grid_size
+        
+        print(f"Layer upscaled: Grid {old_num-self.spline_order} -> {new_grid_size}")
