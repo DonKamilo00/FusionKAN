@@ -1,5 +1,5 @@
 import torch
-import torch.cuda.amp as amp # Import AMP
+import torch.amp as amp # Updated import
 
 # 1. Try to import the compiled C++ extension
 try:
@@ -11,7 +11,7 @@ except ImportError:
 
 class FusionKANFunction(torch.autograd.Function):
     @staticmethod
-    @amp.custom_fwd(cast_inputs=torch.float16) # Cast inputs to FP16 automatically in AMP context
+    @amp.custom_fwd(cast_inputs=torch.float16, device_type='cuda') # Updated Signature
     def forward(ctx, inputs, weights, grid_size, grid_min_val, grid_max_val):
         if not KERNEL_AVAILABLE:
             raise RuntimeError("FusionKAN CUDA kernel not found. Ensure 'pip install .' was successful.")
@@ -19,7 +19,7 @@ class FusionKANFunction(torch.autograd.Function):
         # Ensure contiguous
         inputs_T = inputs.transpose(0, 1).contiguous()
         
-        # Grid bounds are scalars, keep them as is (usually FP32 in config)
+        # Grid bounds are scalars, keep them as is
         g_min = grid_min_val.item()
         g_max = grid_max_val.item()
         
@@ -34,7 +34,7 @@ class FusionKANFunction(torch.autograd.Function):
         return output_T.transpose(0, 1)
 
     @staticmethod
-    @amp.custom_bwd
+    @amp.custom_bwd(device_type='cuda') # Updated Signature
     def backward(ctx, grad_out):
         basis_T, index_T, weights, inputs_T = ctx.saved_tensors
         grad_out_T = grad_out.transpose(0, 1).contiguous()

@@ -5,29 +5,26 @@
 #include <vector>
 
 // ==========================================================================
-// MIXED PRECISION SUPPORT (FP16)
-// 1. Math is done in float32 for stability.
-// 2. Storage is scalar_t (float or half).
-// 3. Custom atomicAdd wrapper for Half precision.
+// FUSION KAN v2.0
+// Fixed Atomic Contention in backward_inputs using Safe Shared Memory Reduction
 // ==========================================================================
 
-// Helper: Atomic Add that handles __half conversion
+// Helper: Atomic Add (FP16 Support)
 template <typename T>
 __device__ __forceinline__ void fast_atomic_add(T* address, T val) {
     atomicAdd(address, val);
 }
 
-// Specialization for at::Half (maps to __half in CUDA)
 template <>
 __device__ __forceinline__ void fast_atomic_add(at::Half* address, at::Half val) {
-    // T4 (CC 7.5) supports atomicAdd for __half natively
     #if __CUDA_ARCH__ >= 600
         atomicAdd(reinterpret_cast<__half*>(address), static_cast<__half>(val));
     #else
-        // Fallback for very old GPUs (not T4): CAS loop (omitted for brevity)
+        // Fallback omitted for brevity
     #endif
 }
 
+// Math Helpers
 template <typename T>
 __device__ __forceinline__ void compute_cubic_basis(float u, float* b) {
     float u2 = u * u; 
@@ -60,7 +57,6 @@ __global__ void basis_kernel(
     if (b >= nbatch || i >= nfeat) return;
     
     int flat_idx = i * nbatch + b;
-    // Load as T, convert to float for math
     float x = static_cast<float>(inputs[flat_idx]);
     float step = (max - min) / static_cast<float>(grid_size);
     
@@ -78,7 +74,6 @@ __global__ void basis_kernel(
     compute_cubic_basis<T>(u, b_val);
     
     int out_ptr = (i * nbatch * 4) + (b * 4);
-    // Write back as T
     basis_out[out_ptr + 0] = static_cast<T>(b_val[0]); 
     basis_out[out_ptr + 1] = static_cast<T>(b_val[1]);
     basis_out[out_ptr + 2] = static_cast<T>(b_val[2]); 
@@ -99,7 +94,6 @@ __global__ void forward_kernel(
     int o = blockIdx.y * blockDim.y + threadIdx.y;
     if (b >= nbatch || o >= nout) return;
     
-    // Accumulate in float for precision, even if T is half
     float acc = 0.0f;
     for (int i = 0; i < nfeat; i++) {
         int flat_idx = i * nbatch + b;
@@ -107,7 +101,6 @@ __global__ void forward_kernel(
         int basis_ptr = (flat_idx * 4);
         int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
         
-        // Cast __ldg reads to float
         acc += static_cast<float>(basis[basis_ptr + 0]) * static_cast<float>(__ldg(&weights[w_ptr + 0]));
         acc += static_cast<float>(basis[basis_ptr + 1]) * static_cast<float>(__ldg(&weights[w_ptr + 1]));
         acc += static_cast<float>(basis[basis_ptr + 2]) * static_cast<float>(__ldg(&weights[w_ptr + 2]));
@@ -143,7 +136,6 @@ __global__ void backward_weights_shared_kernel(
         int k = index[flat_idx];
         int basis_ptr = flat_idx * 4;
 
-        // Math in float -> cast result to T -> fast_atomic_add
         fast_atomic_add(&s_grads[k + 0], static_cast<T>(gy * static_cast<float>(basis[basis_ptr + 0])));
         fast_atomic_add(&s_grads[k + 1], static_cast<T>(gy * static_cast<float>(basis[basis_ptr + 1])));
         fast_atomic_add(&s_grads[k + 2], static_cast<T>(gy * static_cast<float>(basis[basis_ptr + 2])));
@@ -157,7 +149,7 @@ __global__ void backward_weights_shared_kernel(
     }
 }
 
-// 4. Backward Inputs (Direct Atomics)
+// 4. Backward Inputs (Shared Memory Reduction - Safe Version)
 template <typename T>
 __global__ void backward_inputs_kernel(
     const T* __restrict__ grad_out, 
@@ -169,56 +161,85 @@ __global__ void backward_inputs_kernel(
     int nbatch, int nfeat, int nout, int grid_size, int ncoeffs, 
     float min, float max) 
 {
+    // Shared memory for min/max gradients (float for precision during accumulation)
+    __shared__ float s_min_grad;
+    __shared__ float s_max_grad;
+    
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    
+    // 1. Initialize Shared Memory
+    if (tid == 0) {
+        s_min_grad = 0.0f;
+        s_max_grad = 0.0f;
+    }
+    __syncthreads();
+
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     
-    if (b >= nbatch || i >= nfeat) return;
-    
-    int flat_idx = i * nbatch + b;
-    float x = static_cast<float>(inputs[flat_idx]);
-    float step = (max - min) / static_cast<float>(grid_size);
+    // 2. Thread-Local Accumulation
+    float local_d_min = 0.0f;
+    float local_d_max = 0.0f;
 
-    if (x >= min && x <= max) {
-        float x_clamped = x;
-        if (x_clamped > max) x_clamped = max - 1e-5f;
-        
-        float grid_pos = (x_clamped - min) / step;
-        int k = static_cast<int>(floorf(grid_pos));
-        if (k < 0) k = 0; 
-        if (k > grid_size - 1) k = grid_size - 1;
-        
-        float u = grid_pos - static_cast<float>(k);
-        float db[4];
-        compute_cubic_derivative<T>(u, db); 
-        
-        float acc = 0.0f;
-        for (int o = 0; o < nout; o++) {
-            float gy = static_cast<float>(grad_out[o * nbatch + b]);
-            int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
+    if (b < nbatch && i < nfeat) {
+        int flat_idx = i * nbatch + b;
+        float x = static_cast<float>(inputs[flat_idx]);
+        float step = (max - min) / static_cast<float>(grid_size);
+
+        if (x >= min && x <= max) {
+            float x_clamped = x;
+            if (x_clamped > max) x_clamped = max - 1e-5f;
             
-            float dot = db[0] * static_cast<float>(__ldg(&weights[w_ptr + 0])) + 
-                        db[1] * static_cast<float>(__ldg(&weights[w_ptr + 1])) + 
-                        db[2] * static_cast<float>(__ldg(&weights[w_ptr + 2])) + 
-                        db[3] * static_cast<float>(__ldg(&weights[w_ptr + 3]));
-            acc += gy * dot;
+            float grid_pos = (x_clamped - min) / step;
+            int k = static_cast<int>(floorf(grid_pos));
+            if (k < 0) k = 0; 
+            if (k > grid_size - 1) k = grid_size - 1;
+            
+            float u = grid_pos - static_cast<float>(k);
+            float db[4];
+            compute_cubic_derivative<T>(u, db); 
+            
+            float acc = 0.0f;
+            for (int o = 0; o < nout; o++) {
+                float gy = static_cast<float>(grad_out[o * nbatch + b]);
+                int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
+                
+                float dot = db[0] * static_cast<float>(__ldg(&weights[w_ptr + 0])) + 
+                            db[1] * static_cast<float>(__ldg(&weights[w_ptr + 1])) + 
+                            db[2] * static_cast<float>(__ldg(&weights[w_ptr + 2])) + 
+                            db[3] * static_cast<float>(__ldg(&weights[w_ptr + 3]));
+                acc += gy * dot;
+            }
+            
+            float grad_x = acc * (1.0f / step);
+            grad_inputs[flat_idx] = static_cast<T>(grad_x);
+
+            float x_norm = (x - min) / (max - min);
+            local_d_min = grad_x * (x_norm - 1.0f);
+            local_d_max = grad_x * (-x_norm);
+        } else {
+            grad_inputs[flat_idx] = static_cast<T>(0.0f);
         }
-        
-        float grad_x = acc * (1.0f / step);
-        grad_inputs[flat_idx] = static_cast<T>(grad_x);
+    }
 
-        float x_norm = (x - min) / (max - min);
-        float d_min = grad_x * (x_norm - 1.0f);
-        float d_max = grad_x * (-x_norm);
+    // 3. Atomic Add to Shared Memory
+    // Only add if non-zero to save cycles (though divergence penalty might apply)
+    // Using atomicAdd on shared float is fast.
+    atomicAdd(&s_min_grad, local_d_min);
+    atomicAdd(&s_max_grad, local_d_max);
+    
+    __syncthreads();
 
-        fast_atomic_add(grad_min, static_cast<T>(d_min));
-        fast_atomic_add(grad_max, static_cast<T>(d_max));
-    } else {
-        grad_inputs[flat_idx] = static_cast<T>(0.0f);
+    // 4. Flush Shared to Global (Only Thread 0)
+    // Now we only do 1 atomic to global memory per block, instead of 256.
+    if (tid == 0) {
+        fast_atomic_add(grad_min, static_cast<T>(s_min_grad));
+        fast_atomic_add(grad_max, static_cast<T>(s_max_grad));
     }
 }
 
 // ==========================================================================
-// PYBIND11 (With HALF Support)
+// PYBIND11
 // ==========================================================================
 std::vector<torch::Tensor> compute_basis(torch::Tensor inputs, int grid_size, double min, double max) {
     int num_features = inputs.size(0); 
@@ -227,7 +248,6 @@ std::vector<torch::Tensor> compute_basis(torch::Tensor inputs, int grid_size, do
     auto index = torch::empty({num_features, num_batch}, inputs.options().dtype(torch::kInt32));
     dim3 threads(16, 16);
     dim3 blocks((num_batch + 15)/16, (num_features + 15)/16);
-    // CHANGE: AT_DISPATCH_FLOATING_TYPES_AND_HALF
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(inputs.scalar_type(), "basis", ([&] {
         basis_kernel<scalar_t><<<blocks, threads>>>(inputs.data_ptr<scalar_t>(), basis.data_ptr<scalar_t>(), index.data_ptr<int>(), num_batch, num_features, grid_size, static_cast<float>(min), static_cast<float>(max));
     }));
