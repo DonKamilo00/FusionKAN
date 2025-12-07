@@ -4,9 +4,9 @@
 #include <vector>
 
 // ==========================================================================
-// FIXED BACKWARD PASS
-// 1. backward_weights_shared_kernel: Shared Memory Tiling for weights.
-// 2. backward_inputs_kernel: Fixed race condition and unsafe barrier.
+// FUSION KAN CUDA KERNELS
+// 1. backward_weights_shared_kernel: Shared Memory Tiling (Performance Critical)
+// 2. backward_inputs_kernel: Direct Atomics (Correctness Critical)
 // ==========================================================================
 
 template <typename T>
@@ -136,7 +136,8 @@ __global__ void backward_weights_shared_kernel(
     }
 }
 
-// 4. Backward Inputs (Fixed Race Condition & Unsafe Barrier)
+// 4. Backward Inputs (Fixed: Direct Global Atomics)
+// Removed Shared Memory reduction for min/max to ensure numerical stability with double precision.
 template <typename T>
 __global__ void backward_inputs_kernel(
     const T* __restrict__ grad_out, 
@@ -148,74 +149,55 @@ __global__ void backward_inputs_kernel(
     int nbatch, int nfeat, int nout, int grid_size, int ncoeffs, 
     T min, T max) 
 {
-    __shared__ float s_min_grad;
-    __shared__ float s_max_grad;
-    
-    // Linear thread ID within block
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    
-    // 1. Initialize Shared Memory (Only Thread 0)
-    if (tid == 0) {
-        s_min_grad = 0.0f;
-        s_max_grad = 0.0f;
-    }
-    __syncthreads(); // Safe Barrier (All threads reach this)
-
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     
-    // 2. Conditional Execution (No Early Return)
-    if (b < nbatch && i < nfeat) {
-        T step = (max - min) / static_cast<T>(grid_size);
-        int flat_idx = i * nbatch + b;
-        T x = inputs[flat_idx];
-        
-        if (x >= min && x <= max) {
-            T x_clamped = x;
-            if (x_clamped > max) x_clamped = max - static_cast<T>(1e-5);
-            
-            T grid_pos = (x_clamped - min) / step;
-            int k = static_cast<int>(floor(grid_pos));
-            if (k < 0) k = 0; 
-            if (k > grid_size - 1) k = grid_size - 1;
-            
-            T u = grid_pos - static_cast<T>(k);
-            T db[4];
-            compute_cubic_derivative(u, db); 
-            
-            T acc = 0.0f;
-            for (int o = 0; o < nout; o++) {
-                T gy = grad_out[o * nbatch + b];
-                int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
-                
-                T dot = db[0] * __ldg(&weights[w_ptr + 0]) + 
-                        db[1] * __ldg(&weights[w_ptr + 1]) + 
-                        db[2] * __ldg(&weights[w_ptr + 2]) + 
-                        db[3] * __ldg(&weights[w_ptr + 3]);
-                acc += gy * dot;
-            }
-            
-            T grad_x = acc * (static_cast<T>(1.0f) / step);
-            grad_inputs[flat_idx] = grad_x;
-
-            T x_norm = (x - min) / (max - min);
-            T d_min = grad_x * (x_norm - 1.0f);
-            T d_max = grad_x * (-x_norm);
-
-            // Accumulate to shared
-            atomicAdd(&s_min_grad, static_cast<float>(d_min));
-            atomicAdd(&s_max_grad, static_cast<float>(d_max));
-        } else {
-             grad_inputs[flat_idx] = 0.0f;
-        }
-    }
+    if (b >= nbatch || i >= nfeat) return;
     
-    __syncthreads(); // Safe Barrier
+    int flat_idx = i * nbatch + b;
+    T x = inputs[flat_idx];
+    T step = (max - min) / static_cast<T>(grid_size);
 
-    // 3. Flush to Global (Only Thread 0)
-    if (tid == 0) {
-        atomicAdd(grad_min, static_cast<T>(s_min_grad));
-        atomicAdd(grad_max, static_cast<T>(s_max_grad));
+    // Only compute gradients if inside grid bounds
+    if (x >= min && x <= max) {
+        T x_clamped = x;
+        if (x_clamped > max) x_clamped = max - static_cast<T>(1e-5);
+        
+        T grid_pos = (x_clamped - min) / step;
+        int k = static_cast<int>(floor(grid_pos));
+        if (k < 0) k = 0; 
+        if (k > grid_size - 1) k = grid_size - 1;
+        
+        T u = grid_pos - static_cast<T>(k);
+        T db[4];
+        compute_cubic_derivative(u, db); 
+        
+        T acc = 0.0f;
+        for (int o = 0; o < nout; o++) {
+            T gy = grad_out[o * nbatch + b];
+            int w_ptr = (o * nfeat * ncoeffs) + (i * ncoeffs) + k;
+            
+            T dot = db[0] * __ldg(&weights[w_ptr + 0]) + 
+                    db[1] * __ldg(&weights[w_ptr + 1]) + 
+                    db[2] * __ldg(&weights[w_ptr + 2]) + 
+                    db[3] * __ldg(&weights[w_ptr + 3]);
+            acc += gy * dot;
+        }
+        
+        T grad_x = acc * (static_cast<T>(1.0f) / step);
+        grad_inputs[flat_idx] = grad_x;
+
+        // Gradients for Min/Max
+        T x_norm = (x - min) / (max - min);
+        T d_min = grad_x * (x_norm - 1.0f);
+        T d_max = grad_x * (-x_norm);
+
+        // Atomic Add to Global Memory
+        // Safe for double precision if GPU architecture >= Pascal (which T4 is)
+        atomicAdd(grad_min, d_min);
+        atomicAdd(grad_max, d_max);
+    } else {
+        grad_inputs[flat_idx] = 0.0f;
     }
 }
 
